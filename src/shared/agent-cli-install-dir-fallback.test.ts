@@ -121,11 +121,16 @@ describe('agent CLI install-dir fallback', () => {
     })
   })
 
-  it('leaves the win32 branch on its own install dirs', () => {
+  it('finds Windows CLIs in npm and the official Antigravity install directory', () => {
     const home = 'C:/Users/tester'
-    stage(join(home, 'AppData', 'Roaming', 'npm', 'codex.cmd'), join('/usr/local/bin', 'claude'))
-    expect(resolveAll(['codex', 'claude'], { platform: 'win32', homePath: home })).toEqual({
+    stage(
+      join(home, 'AppData', 'Roaming', 'npm', 'codex.cmd'),
+      join(home, 'AppData', 'Local', 'agy', 'bin', 'agy.exe'),
+      join('/usr/local/bin', 'claude')
+    )
+    expect(resolveAll(['codex', 'agy', 'claude'], { platform: 'win32', homePath: home })).toEqual({
       codex: join(home, 'AppData', 'Roaming', 'npm', 'codex.cmd'),
+      agy: join(home, 'AppData', 'Local', 'agy', 'bin', 'agy.exe'),
       claude: 'claude'
     })
   })
