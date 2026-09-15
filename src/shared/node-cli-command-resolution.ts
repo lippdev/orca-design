@@ -106,6 +106,10 @@ function getBaseVersionManagerDirectories(platform: NodeJS.Platform, homePath: s
     directories.push(join(homePath, 'AppData', 'Roaming', 'npm'))
     directories.push(join(homePath, 'AppData', 'Local', 'pnpm'))
     directories.push(join(homePath, 'AppData', 'Local', 'Yarn', 'bin'))
+    // Why: the official Antigravity installer puts agy.exe here. Its own
+    // default location must work for both preflight detection and usage probes
+    // even when a GUI launch has not inherited the user's updated PATH.
+    directories.push(join(homePath, 'AppData', 'Local', 'agy', 'bin'))
   } else {
     directories.push(join(homePath, '.local', 'bin'))
     // Why: pnpm uses platform-specific global bin directories that differ from

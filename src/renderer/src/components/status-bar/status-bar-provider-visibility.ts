@@ -8,11 +8,8 @@ export type UsageProviderSettings = Pick<
   | 'opencodeSessionCookie'
   | 'geminiCliOAuthEnabled'
 > & {
-  // Why: Antigravity has no separate persisted usage credential in Orca. The
-  // checked status-bar item is the durable user signal; StatusBar only sets
-  // this after PATH detection says the agent is available. Durability further
-  // requires geminiCliOAuthEnabled — the snapshot mirrors the Gemini fetch,
-  // which never yields data while that opt-in is off.
+  // Why: Antigravity's official CLI owns its credential. The checked status
+  // item plus PATH detection is therefore the durable user signal.
   antigravityUsageConfigured: boolean
   // Why: MiniMax/Grok sign-in live on disk, not in settings; main sets these each poll.
   minimaxCookieConfigured: boolean
@@ -75,8 +72,7 @@ export function hasUsageProviderSettings(
     (settings?.claudeManagedAccounts?.length ?? 0) > 0 ||
     settings?.geminiCliOAuthEnabled === true ||
     Boolean(settings?.opencodeSessionCookie?.trim()) ||
-    // Antigravity's durable signal requires geminiCliOAuthEnabled, so it is
-    // already covered by the gemini term above.
+    settings?.antigravityUsageConfigured === true ||
     settings?.minimaxCookieConfigured === true ||
     settings?.minimaxApiKeyConfigured === true ||
     settings?.grokAuthConfigured === true
@@ -103,10 +99,7 @@ export function hasUsageProviderSettingsForProvider(
     return Boolean(settings.opencodeSessionCookie?.trim())
   }
   if (providerId === 'antigravity') {
-    // Why: the Antigravity snapshot mirrors the Gemini fetch, which stays
-    // 'unavailable' until the user opts into Gemini CLI OAuth. Without that
-    // gate the default-on checked item would pin a permanently dead bar.
-    return settings.antigravityUsageConfigured === true && settings.geminiCliOAuthEnabled === true
+    return settings.antigravityUsageConfigured === true
   }
   if (providerId === 'minimax') {
     return settings.minimaxCookieConfigured === true || settings.minimaxApiKeyConfigured === true

@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { RateLimitService } from './service'
 import { fetchClaudeRateLimits } from './claude-fetcher'
 import { fetchCodexRateLimits } from './codex-fetcher'
+import { fetchAntigravityRateLimits } from './antigravity-usage-fetcher'
 import { fetchGeminiRateLimits } from './gemini-usage-fetcher'
 import {
   errorProvider,
@@ -21,6 +22,10 @@ vi.mock('./codex-fetcher', () => ({
 
 vi.mock('./gemini-usage-fetcher', () => ({
   fetchGeminiRateLimits: vi.fn()
+}))
+
+vi.mock('./antigravity-usage-fetcher', () => ({
+  fetchAntigravityRateLimits: vi.fn()
 }))
 
 vi.mock('./kimi-fetcher', () => ({
@@ -52,9 +57,12 @@ describe('RateLimitService Antigravity usage', () => {
     resetRateLimitProviderMocks()
     vi.mocked(fetchClaudeRateLimits).mockResolvedValue(okProvider('claude', 7))
     vi.mocked(fetchCodexRateLimits).mockResolvedValue(okProvider('codex', 20))
+    vi.mocked(fetchAntigravityRateLimits).mockResolvedValue(
+      okProvider('antigravity', 42, Date.now())
+    )
   })
 
-  it('does not republish a Gemini failure as an Antigravity refresh failure', async () => {
+  it('keeps Antigravity usage independent from Gemini failures', async () => {
     vi.mocked(fetchGeminiRateLimits).mockResolvedValue(
       errorProvider('gemini', 'Gemini project ID not found')
     )
@@ -63,38 +71,43 @@ describe('RateLimitService Antigravity usage', () => {
     await service.refresh()
 
     const state = service.getState()
-    expect(state.antigravity?.status).toBe('unavailable')
-    expect(state.antigravity?.error).not.toContain('Gemini project ID not found')
-    expect(state.antigravity?.session).toBeNull()
-    // Why: the real Gemini failure must still surface under its own provider.
+    expect(state.antigravity?.status).toBe('ok')
+    expect(state.antigravity?.session?.usedPercent).toBe(42)
     expect(state.gemini?.status).toBe('error')
     expect(state.gemini?.error).toBe('Gemini project ID not found')
   })
 
-  it('keeps mirroring a successful Gemini read under the Antigravity provider', async () => {
-    vi.mocked(fetchGeminiRateLimits).mockResolvedValue(okProvider('gemini', 42, Date.now()))
+  it('does not use Gemini quota when the Antigravity CLI is unavailable', async () => {
+    vi.mocked(fetchGeminiRateLimits).mockResolvedValue(okProvider('gemini', 73, Date.now()))
+    vi.mocked(fetchAntigravityRateLimits).mockResolvedValue({
+      provider: 'antigravity',
+      session: null,
+      weekly: null,
+      updatedAt: Date.now(),
+      error: 'Antigravity CLI is not installed',
+      status: 'unavailable'
+    })
     const service = new RateLimitService()
 
     await service.refresh()
 
     const state = service.getState()
-    expect(state.antigravity?.status).toBe('ok')
+    expect(state.antigravity?.status).toBe('unavailable')
     expect(state.antigravity?.provider).toBe('antigravity')
-    expect(state.antigravity?.session?.usedPercent).toBe(42)
+    expect(state.antigravity?.session).toBeNull()
+    expect(state.gemini?.session?.usedPercent).toBe(73)
   })
 
-  it('never leaves a cached Antigravity snapshot in the error retry lane', async () => {
-    vi.mocked(fetchGeminiRateLimits).mockResolvedValueOnce(okProvider('gemini', 42, Date.now()))
+  it('retains a successful Antigravity snapshot when its own refresh fails', async () => {
     const service = new RateLimitService()
     await service.refresh()
 
-    vi.mocked(fetchGeminiRateLimits).mockResolvedValue(
-      errorProvider('gemini', 'Token refresh failed')
+    vi.mocked(fetchAntigravityRateLimits).mockResolvedValue(
+      errorProvider('antigravity', 'CLI quota request timed out')
     )
     await service.refresh()
 
-    // Why: stale-retention would otherwise show Gemini numbers as "Refresh failed" Antigravity usage.
-    expect(service.getState().antigravity?.status).toBe('unavailable')
-    expect(service.getState().antigravity?.session).toBeNull()
+    expect(service.getState().antigravity?.status).toBe('error')
+    expect(service.getState().antigravity?.session?.usedPercent).toBe(42)
   })
 })
