@@ -1,18 +1,18 @@
 import { closeSync, openSync, readSync, readdirSync } from 'node:fs'
-import http from 'node:http'
-import https from 'node:https'
 import { homedir } from 'node:os'
 import path from 'node:path'
 import type { ProviderRateLimits, RateLimitWindow } from '../../shared/rate-limit-types'
+import {
+  ANTIGRAVITY_LOOPBACK_HOST,
+  postAntigravityLoopbackQuota
+} from './antigravity-loopback-quota'
 
 const QUOTA_PATH = '/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary'
-const LOOPBACK_HOST = '127.0.0.1'
-const REQUEST_TIMEOUT_MS = 2_500
-const SESSION_WINDOW_MINUTES = 300
-const WEEKLY_WINDOW_MINUTES = 10_080
 
 export const ANTIGRAVITY_USAGE_UNAVAILABLE =
   'Antigravity usage is not available. Start agy so Orca can read its quota.'
+export const ANTIGRAVITY_USAGE_PROBE_FAILED =
+  'Antigravity usage is not available. The local Agy LanguageServer did not return quota.'
 
 export type AntigravityLanguageServerEndpoint = {
   pid: number
@@ -24,24 +24,30 @@ export type AntigravityUsageFetchDeps = {
   endpoint?: AntigravityLanguageServerEndpoint | null
   postQuota?: (url: string) => Promise<unknown>
   now?: () => number
+  requestTimeoutMs?: number
+  maxResponseBytes?: number
 }
 
-type Cadence = 'session' | 'weekly'
-type CadenceWindow = RateLimitWindow & { cadence: Cadence }
+type CadenceWindow = RateLimitWindow & { cadence: 'session' | 'weekly' }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
 
-function unavailable(now: number): ProviderRateLimits {
+function failedLimits(
+  now: number,
+  error: string,
+  status: 'unavailable' | 'error',
+  failureKind: 'cli-unavailable' | 'network'
+): ProviderRateLimits {
   return {
     provider: 'antigravity',
     session: null,
     weekly: null,
     updatedAt: now,
-    error: ANTIGRAVITY_USAGE_UNAVAILABLE,
-    status: 'unavailable',
-    usageMetadata: { source: 'cli', failureKind: 'cli-unavailable' }
+    error,
+    status,
+    usageMetadata: { source: 'cli', failureKind }
   }
 }
 
@@ -83,12 +89,11 @@ function windowFromBucket(raw: unknown): CadenceWindow | null {
   const id = typeof raw.bucketId === 'string' ? raw.bucketId : ''
   const name = typeof raw.displayName === 'string' ? raw.displayName : id
   const text = `${id} ${name}`.toLowerCase()
-  const cadence: Cadence | null =
-    text.includes('weekly') || text.includes('7d') || text.includes('7-day')
-      ? 'weekly'
-      : text.includes('5h') || text.includes('five hour') || text.includes('five-hour')
-        ? 'session'
-        : null
+  const cadence: CadenceWindow['cadence'] | null = /weekly|7d|7-day/.test(text)
+    ? 'weekly'
+    : /5h|five[- ]hour/.test(text)
+      ? 'session'
+      : null
   if (!cadence) {
     return null
   }
@@ -96,26 +101,30 @@ function windowFromBucket(raw: unknown): CadenceWindow | null {
   return {
     cadence,
     usedPercent: Math.min(100, Math.max(0, Math.round((1 - remaining) * 100))),
-    windowMinutes: cadence === 'weekly' ? WEEKLY_WINDOW_MINUTES : SESSION_WINDOW_MINUTES,
+    windowMinutes: cadence === 'weekly' ? 10_080 : 300,
     resetsAt: Number.isNaN(resetTime) ? null : resetTime,
     resetDescription: null
   }
 }
 
-function tightest(windows: CadenceWindow[], cadence: Cadence): RateLimitWindow | null {
-  const matches = windows.filter((window) => window.cadence === cadence)
-  if (matches.length === 0) {
-    return null
+function tightest(
+  windows: CadenceWindow[],
+  cadence: CadenceWindow['cadence']
+): RateLimitWindow | null {
+  let chosen: CadenceWindow | null = null
+  for (const window of windows) {
+    if (window.cadence === cadence && (!chosen || window.usedPercent > chosen.usedPercent)) {
+      chosen = window
+    }
   }
-  const chosen = matches.reduce((worst, window) =>
-    window.usedPercent > worst.usedPercent ? window : worst
-  )
-  return {
-    usedPercent: chosen.usedPercent,
-    windowMinutes: chosen.windowMinutes,
-    resetsAt: chosen.resetsAt,
-    resetDescription: chosen.resetDescription
-  }
+  return chosen
+    ? {
+        usedPercent: chosen.usedPercent,
+        windowMinutes: chosen.windowMinutes,
+        resetsAt: chosen.resetsAt,
+        resetDescription: chosen.resetDescription
+      }
+    : null
 }
 
 export function mapAntigravityQuotaSummary(data: unknown): ProviderRateLimits | null {
@@ -199,92 +208,30 @@ function discoverCurrentEndpoint(): AntigravityLanguageServerEndpoint | null {
   return null
 }
 
-function isLoopbackHttpUrl(raw: string): boolean {
-  try {
-    const url = new URL(raw)
-    return (url.protocol === 'http:' || url.protocol === 'https:') && url.hostname === LOOPBACK_HOST
-  } catch {
-    return false
-  }
-}
-
-function postLoopbackQuota(url: string): Promise<unknown> {
-  if (!isLoopbackHttpUrl(url)) {
-    return Promise.resolve(null)
-  }
-  const parsed = new URL(url)
-  const requestOptions: https.RequestOptions = {
-    protocol: parsed.protocol,
-    hostname: LOOPBACK_HOST,
-    port: parsed.port,
-    path: `${parsed.pathname}${parsed.search}`,
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Connect-Protocol-Version': '1'
-    },
-    timeout: REQUEST_TIMEOUT_MS
-  }
-  if (parsed.protocol === 'https:') {
-    // Why: Agy presents a self-signed cert on 127.0.0.1 only.
-    requestOptions.rejectUnauthorized = false
-  }
-  const transport = parsed.protocol === 'https:' ? https : http
-  return new Promise((resolve) => {
-    const request = transport.request(requestOptions, (response) => {
-      const chunks: Buffer[] = []
-      response.on('data', (chunk) => {
-        chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk))
-      })
-      response.on('end', () => {
-        const status = response.statusCode ?? 0
-        if (status < 200 || status >= 300) {
-          resolve(null)
-          return
-        }
-        try {
-          const body: unknown = JSON.parse(Buffer.concat(chunks).toString('utf8'))
-          resolve(body)
-        } catch {
-          resolve(null)
-        }
-      })
-      response.on('error', () => resolve(null))
-    })
-    request.on('timeout', () => {
-      request.destroy()
-      resolve(null)
-    })
-    request.on('error', () => resolve(null))
-    request.end('{"forceRefresh":true}')
-  })
-}
-
 async function probeQuota(
   endpoint: AntigravityLanguageServerEndpoint,
   postQuota: (url: string) => Promise<unknown>,
   now: () => number
 ): Promise<ProviderRateLimits> {
-  const urls: string[] = []
-  if (endpoint.httpPort !== null) {
-    urls.push(`http://${LOOPBACK_HOST}:${endpoint.httpPort}${QUOTA_PATH}`)
-  }
-  if (endpoint.httpsPort !== null) {
-    urls.push(`https://${LOOPBACK_HOST}:${endpoint.httpsPort}${QUOTA_PATH}`)
-  }
+  const urls = [
+    ...(endpoint.httpPort === null
+      ? []
+      : [`http://${ANTIGRAVITY_LOOPBACK_HOST}:${endpoint.httpPort}${QUOTA_PATH}`]),
+    ...(endpoint.httpsPort === null
+      ? []
+      : [`https://${ANTIGRAVITY_LOOPBACK_HOST}:${endpoint.httpsPort}${QUOTA_PATH}`])
+  ]
   for (const url of urls) {
-    let json: unknown
     try {
-      json = await postQuota(url)
+      const mapped = mapAntigravityQuotaSummary(await postQuota(url))
+      if (mapped) {
+        return mapped
+      }
     } catch {
-      json = null
-    }
-    const mapped = json === null ? null : mapAntigravityQuotaSummary(json)
-    if (mapped) {
-      return mapped
+      continue
     }
   }
-  return unavailable(now())
+  return failedLimits(now(), ANTIGRAVITY_USAGE_PROBE_FAILED, 'error', 'network')
 }
 
 export function fetchAntigravityRateLimits(
@@ -293,7 +240,14 @@ export function fetchAntigravityRateLimits(
   const now = deps.now ?? Date.now
   const endpoint = deps.endpoint !== undefined ? deps.endpoint : discoverCurrentEndpoint()
   if (!endpoint) {
-    return Promise.resolve(unavailable(now()))
+    return Promise.resolve(
+      failedLimits(now(), ANTIGRAVITY_USAGE_UNAVAILABLE, 'unavailable', 'cli-unavailable')
+    )
   }
-  return probeQuota(endpoint, deps.postQuota ?? postLoopbackQuota, now)
+  return probeQuota(
+    endpoint,
+    deps.postQuota ??
+      ((url) => postAntigravityLoopbackQuota(url, deps.requestTimeoutMs, deps.maxResponseBytes)),
+    now
+  )
 }

@@ -1,3 +1,6 @@
+import fs from 'node:fs'
+import http from 'node:http'
+import https from 'node:https'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { RateLimitService } from './service'
 import { fetchClaudeRateLimits } from './claude-fetcher'
@@ -90,5 +93,23 @@ describe('RateLimitService Antigravity usage', () => {
     expect(state.antigravity?.session).toBeNull()
     expect(state.gemini?.status).toBe('ok')
     expect(state.gemini?.session?.usedPercent).toBe(42)
+  })
+
+  it('shared harness stub prevents LanguageServer discovery and loopback probes', async () => {
+    const readdir = vi.spyOn(fs, 'readdirSync')
+    const httpRequest = vi.spyOn(http, 'request')
+    const httpsRequest = vi.spyOn(https, 'request')
+    try {
+      const service = new RateLimitService()
+      await service.refresh()
+      expect(vi.mocked(fetchAntigravityRateLimits)).toHaveBeenCalled()
+      expect(readdir).not.toHaveBeenCalled()
+      expect(httpRequest).not.toHaveBeenCalled()
+      expect(httpsRequest).not.toHaveBeenCalled()
+    } finally {
+      readdir.mockRestore()
+      httpRequest.mockRestore()
+      httpsRequest.mockRestore()
+    }
   })
 })

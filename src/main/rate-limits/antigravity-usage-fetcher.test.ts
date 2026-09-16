@@ -1,5 +1,8 @@
+import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
+import { once } from 'node:events'
 import { describe, expect, it } from 'vitest'
 import {
+  ANTIGRAVITY_USAGE_PROBE_FAILED,
   ANTIGRAVITY_USAGE_UNAVAILABLE,
   fetchAntigravityRateLimits,
   mapAntigravityQuotaSummary,
@@ -136,8 +139,20 @@ describe('fetchAntigravityRateLimits', () => {
     expect(limits.status).toBe('unavailable')
     expect(limits.provider).toBe('antigravity')
     expect(limits.error).toBe(ANTIGRAVITY_USAGE_UNAVAILABLE)
+    expect(limits.usageMetadata?.failureKind).toBe('cli-unavailable')
     expect(limits.session).toBeNull()
     expect(limits.weekly).toBeNull()
+  })
+
+  it('reports a probe error when a LanguageServer is found but quota is not returned', async () => {
+    const limits = await fetchAntigravityRateLimits({
+      endpoint,
+      postQuota: async () => null
+    })
+    expect(limits.status).toBe('error')
+    expect(limits.error).toBe(ANTIGRAVITY_USAGE_PROBE_FAILED)
+    expect(limits.usageMetadata?.failureKind).toBe('network')
+    expect(limits.session).toBeNull()
   })
 
   it('falls back to the HTTPS loopback port when HTTP does not answer', async () => {
@@ -157,5 +172,66 @@ describe('fetchAntigravityRateLimits', () => {
       'https://127.0.0.1:4313/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary'
     ])
     expect(limits.status).toBe('ok')
+  })
+})
+
+async function listen(
+  handler: (request: IncomingMessage, response: ServerResponse) => void
+): Promise<{ port: number; close: () => Promise<void> }> {
+  const server = createServer(handler)
+  server.listen(0, '127.0.0.1')
+  await once(server, 'listening')
+  const address = server.address()
+  if (address === null || typeof address === 'string') {
+    throw new Error('expected a TCP listen address')
+  }
+  return {
+    port: address.port,
+    close: async () => {
+      server.closeAllConnections()
+      server.close()
+      await once(server, 'close')
+    }
+  }
+}
+
+describe('Antigravity loopback quota request limits', () => {
+  it('aborts an oversized quota response and reports a probe failure', async () => {
+    const { port, close } = await listen((_request, response) => {
+      response.writeHead(200, { 'Content-Type': 'application/json' })
+      response.end('{"response":{"groups":[]}}'.padEnd(64, '0'))
+    })
+    try {
+      const limits = await fetchAntigravityRateLimits({
+        endpoint: { pid: 4242, httpPort: port, httpsPort: null },
+        maxResponseBytes: 16
+      })
+      expect(limits.status).toBe('error')
+      expect(limits.error).toBe(ANTIGRAVITY_USAGE_PROBE_FAILED)
+    } finally {
+      await close()
+    }
+  })
+
+  it('aborts a continuously streaming quota response on the wall-clock deadline', async () => {
+    const { port, close } = await listen((_request, response) => {
+      response.writeHead(200, { 'Content-Type': 'application/json' })
+      const timer = setInterval(() => {
+        response.write(' ')
+      }, 10)
+      response.on('close', () => clearInterval(timer))
+    })
+    try {
+      const started = Date.now()
+      const limits = await fetchAntigravityRateLimits({
+        endpoint: { pid: 4242, httpPort: port, httpsPort: null },
+        requestTimeoutMs: 80
+      })
+      expect(Date.now() - started).toBeLessThan(1_000)
+      expect(limits.status).toBe('error')
+      expect(limits.error).toBe(ANTIGRAVITY_USAGE_PROBE_FAILED)
+    } finally {
+      await close()
+    }
   })
 })
