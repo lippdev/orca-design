@@ -22,6 +22,7 @@ export type AntigravityLanguageServerEndpoint = {
 
 export type AntigravityUsageFetchDeps = {
   endpoint?: AntigravityLanguageServerEndpoint | null
+  homedir?: () => string
   postQuota?: (url: string) => Promise<unknown>
   now?: () => number
   requestTimeoutMs?: number
@@ -173,19 +174,21 @@ function isProcessAlive(pid: number): boolean {
   }
 }
 
-function discoverCurrentEndpoint(): AntigravityLanguageServerEndpoint | null {
-  const logDir = path.join(homedir(), '.gemini', 'antigravity-cli', 'log')
+function discoverCurrentEndpoint(
+  resolveHome: () => string = homedir
+): AntigravityLanguageServerEndpoint | null {
+  const logDir = path.join(resolveHome(), '.gemini', 'antigravity-cli', 'log')
   let names: string[]
   try {
     names = readdirSync(logDir)
   } catch {
     return null
   }
+  // Why: recency is only search order; a live LanguageServer can outlive newer exited logs.
   names = names
     .filter((name) => name.startsWith('cli-') && name.endsWith('.log'))
     .sort()
     .toReversed()
-    .slice(0, 12)
   for (const name of names) {
     try {
       const fd = openSync(path.join(logDir, name), 'r')
@@ -238,7 +241,8 @@ export function fetchAntigravityRateLimits(
   deps: AntigravityUsageFetchDeps = {}
 ): Promise<ProviderRateLimits> {
   const now = deps.now ?? Date.now
-  const endpoint = deps.endpoint !== undefined ? deps.endpoint : discoverCurrentEndpoint()
+  const endpoint =
+    deps.endpoint !== undefined ? deps.endpoint : discoverCurrentEndpoint(deps.homedir)
   if (!endpoint) {
     return Promise.resolve(
       failedLimits(now(), ANTIGRAVITY_USAGE_UNAVAILABLE, 'unavailable', 'cli-unavailable')

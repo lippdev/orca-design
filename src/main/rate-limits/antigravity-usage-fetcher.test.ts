@@ -1,5 +1,8 @@
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
 import { once } from 'node:events'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import {
   ANTIGRAVITY_USAGE_PROBE_FAILED,
@@ -55,6 +58,34 @@ const LIVE_LOG = [
   'listening on random port at 4312 for HTTP',
   'listening on random port at 4313 for HTTPS (gRPC)'
 ].join('\n')
+
+const QUOTA_25_PERCENT_USED = {
+  response: {
+    groups: [
+      {
+        displayName: 'Gemini Models',
+        buckets: [
+          {
+            bucketId: 'gemini-5h',
+            displayName: 'Five Hour Limit Remaining',
+            remainingFraction: 0.75,
+            resetTime: '2026-09-16T01:00:00Z'
+          }
+        ]
+      }
+    ]
+  }
+}
+
+/** Above pid_max on every supported POSIX host, so kill(pid, 0) is a real ESRCH. */
+const EXITED_SESSION_PID = 2_147_483_647
+
+function languageServerLog(pid: number, httpPort: number): string {
+  return [
+    `Starting language server process with pid ${pid}`,
+    `listening on random port at ${httpPort} for HTTP`
+  ].join('\n')
+}
 
 describe('parseAntigravityLanguageServerLog', () => {
   it('reads pid and both loopback ports from an Agy startup banner', () => {
@@ -232,6 +263,40 @@ describe('Antigravity loopback quota request limits', () => {
       expect(limits.error).toBe(ANTIGRAVITY_USAGE_PROBE_FAILED)
     } finally {
       await close()
+    }
+  })
+})
+
+describe('Antigravity LanguageServer log discovery', () => {
+  it('still finds an older live session after 12 newer exited session logs', async () => {
+    expect(() => process.kill(EXITED_SESSION_PID, 0)).toThrow()
+    const home = mkdtempSync(join(tmpdir(), 'orca-antigravity-usage-'))
+    const logDir = join(home, '.gemini', 'antigravity-cli', 'log')
+    mkdirSync(logDir, { recursive: true })
+    let probeCount = 0
+    const { port, close } = await listen((_request, response) => {
+      probeCount += 1
+      response.writeHead(200, { 'Content-Type': 'application/json' })
+      response.end(JSON.stringify(QUOTA_25_PERCENT_USED))
+    })
+    try {
+      writeFileSync(
+        join(logDir, 'cli-2026-01-01T00-00-00.log'),
+        languageServerLog(process.pid, port)
+      )
+      for (let index = 0; index < 12; index += 1) {
+        writeFileSync(
+          join(logDir, `cli-2026-09-19T00-00-${String(index).padStart(2, '0')}.log`),
+          languageServerLog(EXITED_SESSION_PID, 65_000)
+        )
+      }
+      const limits = await fetchAntigravityRateLimits({ homedir: () => home })
+      expect(limits.status).toBe('ok')
+      expect(limits.session?.usedPercent).toBe(25)
+      expect(probeCount).toBe(1)
+    } finally {
+      await close()
+      rmSync(home, { recursive: true, force: true })
     }
   })
 })
